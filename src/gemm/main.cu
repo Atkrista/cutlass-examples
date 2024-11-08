@@ -5,15 +5,20 @@
 #include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
 
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+
 #include <cute/tensor.hpp>
 
 #include "helpers.hpp"
 
-template <class ProblemShape, class CtaTiler, Class TA, class AStride, class ASmemLayout, class AThreadLayout, class TB, class BStride, class BSmemLayout, class BThreadLayout, class TC, class CStride, class CSmemLayout, class CThreadLayout, class Alpha, class Beta>
-__global__ static __launch_bounds__(decltype(size(CThreadLayout{}))::value) void gemm_device(ProblemShape shape_MNK, Ctatiler cta_tiler,
-                                                                                             TA const *A, Astride dA, ASmemLayout sA_layout, AthreadLayout tA,
-                                                                                             TB const *B, Bstride dB, BSmemLayout sB_layout, BthreadLayout tB,
-                                                                                             TC *C, Cstride dC, CSmemLayout, CthreadLayout tC, Alpha alpha, Beta beta)
+using namespace cute;
+
+template <class ProblemShape, class CtaTiler, class TA, class AStride, class ASmemLayout, class AThreadLayout, class TB, class BStride, class BSmemLayout, class BThreadLayout, class TC, class CStride, class CSmemLayout, class CThreadLayout, class Alpha, class Beta>
+__global__ static __launch_bounds__(decltype(size(CThreadLayout{}))::value) void gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
+                                                                                             const TA *A, AStride dA, ASmemLayout sA_layout, AThreadLayout tA,
+                                                                                             const TB *B, BStride dB, BSmemLayout sB_layout, BThreadLayout tB,
+                                                                                             TC *C, CStride dC, CSmemLayout, CThreadLayout tC, Alpha alpha, Beta beta)
 {
     // Preconditions
     CUTE_STATIC_ASSERT_V(rank(shape_MNK) == Int<3>{});            // (M, N, K)
@@ -66,8 +71,8 @@ __global__ static __launch_bounds__(decltype(size(CThreadLayout{}))::value) void
     Tensor gC = local_tile(mC, cta_tiler, cta_coord, Step<_1, _1, X>{}); // (BLK_M,BLK_N)
 
     // Shared memory buffers
-    __shared__ TA smemA[cosize_v<sA_layout>];
-    __shared__ TB smemB[cosize_v<sB_layout>];
+    __shared__ TA smemA[cosize_v<ASmemLayout>];
+    __shared__ TB smemB[cosize_v<BSmemLayout>];
 
     // Shared memory tensors
     Tensor sA = make_tensor(make_smem_ptr(smemA), sA_layout); // (BLK_M, BLK_K)
@@ -166,6 +171,8 @@ int main(int argc, char **argv)
 
     TI alpha = TI(1.0f);
     TI beta = TI(0.0f);
+    __half alpha_ref = __float2half(1.0f);
+    __half beta_ref = __float2half(0.0f);
 
     // Allocate and Initialize host vectors
     thrust::host_vector<TA> h_A(M * K);
@@ -184,11 +191,25 @@ int main(int argc, char **argv)
     thrust::device_vector<TD> d_D = h_D;
     thrust::device_vector<TE> d_E = h_E;
 
+    // __half type
+    thrust::device_vector<__half> d_A_ref(M * K);
+    thrust::device_vector<__half> d_B_ref(N * K);
+    thrust::device_vector<__half> d_C_ref(M * N, __float2half(0.0f));
+    thrust::device_vector<__half> d_D_ref(P * N);
+    thrust::device_vector<__half> d_E_ref(M * P, __float2half(0.0f));
+
+    thrust::transform(h_A.begin(), h_A.end(), d_A_ref.begin(), [](cutlass::half_t h)
+                      { return *reinterpret_cast<__half *>(&h); });
+    thrust::transform(h_B.begin(), h_B.end(), d_B_ref.begin(), [](cutlass::half_t h)
+                      { return *reinterpret_cast<__half *>(&h); });
+    thrust::transform(h_D.begin(), h_D.end(), d_D_ref.begin(), [](cutlass::half_t h)
+                      { return *reinterpret_cast<__half *>(&h); });
     // NT kernel
     int ldA = M;
     int ldB = N;
     int ldC = M;
     int ldD = P;
+    int ldE = M;
 
     // GEMM_1 = (m,n,k)
     // C = alpha * AB + beta * C
@@ -208,6 +229,7 @@ int main(int argc, char **argv)
     auto dB = make_stride(Int<1>{}, ldB); // (dN, dK)
     auto dC = make_stride(Int<1>{}, ldC); // (dM, dN)
     auto dD = make_stride(Int<1>{}, ldD); // (dP, dN)
+    auto dE = make_stride(Int<1>{}, ldE); // (dM, dP)
 
     // Define CTA tile sizes (static)
     // Use the same tiler for prod & cons GEMMs
@@ -217,12 +239,9 @@ int main(int argc, char **argv)
     auto cta_tile = make_shape(bM, bN, bK); // (BLK_M, BLK_N, BLK_K)
 
     // Define Smem layouts
-    // Prod
-    auto sA = make_layouts(make_shape(bM, bK)); // (m, k) -> smem_index; m-major
-    auto sB = make_layouts(make_shape(bM, bK));
-    // Cons
-    auto sC = make_layouts(make_shape(bM, bK));
-    auto sD = make_layouts(make_shape(bP, bK));
+    // Use same smem layouts for prod & cons GEMMs
+    auto sA = make_layout(make_shape(bM, bK)); // (m, k) -> smem_index; m-major
+    auto sB = make_layout(make_shape(bM, bK));
 
     // Define thread layouts (static)
     // Partition each (BLK_M, BLK_K) and (BLK_N, BLK_K) tile among threads
@@ -230,4 +249,42 @@ int main(int argc, char **argv)
     auto tA = make_layout(make_shape(Int<32>{}, Int<8>{}));  // (m,k) -> thr_idx; m-major
     auto tB = make_layout(make_shape(Int<32>{}, Int<8>{}));  // (n,k) -> thr_idx; n-major
     auto tC = make_layout(make_shape(Int<16>{}, Int<16>{})); // (m,n) -> thr_idx; m-major
+
+    // Launch our kernels
+    dim3 dimBlock(bM, bK);
+    dim3 dimGrid(ceil_div(M, bM), ceil_div(n, bN));
+
+    // Prod kernel
+    gemm_device<decltype(prod_prob_shape), decltype(cta_tile),
+                TA, decltype(dA), decltype(sA), decltype(tA),
+                TB, decltype(dB), decltype(sB), decltype(tB),
+                TC, decltype(dC), decltype(sC), decltype(tC), decltype(alpha), decltype(beta)><<<dimGrid, dimBlock>>>(prob_shape_prod, cta_tile, d_A, dA, sA, tA, d_B, dB, sB, tB, C, dC, NULL, tC, alpha, beta);
+
+    // Consumer Kernel
+    gemm_device<decltype(cons_prob_shape), decltype(cta_tile),
+                TA, decltype(dC), decltype(sA), decltype(tA),
+                TB, decltype(dD), decltype(sB), decltype(tB),
+                TC, decltype(dE), decltype(sC), decltype(tC), decltype(alpha), decltype(beta)><<<dimGrid, dimBlock>>>(prob_shape_cons, cta_tile, d_C, dC, sA, tA, d_D, dD, sB, tB, E, dE, NULL, tC, alpha, beta);
+
+    // Reference cuBlas kernels
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+
+    CUBLAS_CHECK(cublasHgemm(handle,
+                             CUBLAS_OP_N, CUBLAS_OP_T,
+                             M, N, K,
+                             &alpha_ref,
+                             d_A_ref.data().get(), ldA,
+                             d_B_ref.data().get(), ldB,
+                             &beta_ref,
+                             d_C_ref.data().get(), ldC));
+
+    CUBLAS_CHECK(cublasHgemm(handle,
+                             CUBLAS_OP_N, CUBLAS_OP_T,
+                             M, P, N,
+                             &alpha_ref,
+                             d_C_ref.data().get(), ldC,
+                             d_D_ref.data().get(), ldD,
+                             &beta_ref,
+                             d_E_ref.data().get(), ldE));
 }

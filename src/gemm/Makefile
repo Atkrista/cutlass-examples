@@ -15,7 +15,7 @@ CUDA_INCLUDES = -I$(INCDIR) -I$(INCDIR)/cutlass/include -I$(INCDIR)/cutlass/tool
 LIBDIRS = -L"$(CUDA_ROOT)/targets/sbsa-linux/lib/stubs"  -L"$(CUDA_ROOT)/targets/sbsa-linux/lib"
 
 # Libraries to link
-LIBS = -ldl -lcudart -lcuda -lcudadevrt
+LIBS = -ldl -lcudart -lcuda -lcudadevrt -lcublas
 
 # Source files
 SRCS = $(wildcard *.cu)
